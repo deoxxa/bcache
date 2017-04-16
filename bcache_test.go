@@ -2,6 +2,7 @@ package bcache
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -196,26 +197,26 @@ func TestEvictionFIFO(t *testing.T) {
 		n bool
 	}
 
-	for _, e := range []tc{
-		{"a", true},
-		{"b", true},
-		{"a", false},
-		{"c", true},
-		{"a", false},
-		{"d", true},
-		{"a", false},
-		{"e", true},
-		{"a", false},
-		{"f", true},
-		{"a", true},
+	for i, e := range []tc{
+		{"1", true},
+		{"2", true},
+		{"1", false},
+		{"3", true},
+		{"1", false},
+		{"4", true},
+		{"1", false},
+		{"5", true},
+		{"1", false},
+		{"6", true},
+		{"1", true},
 	} {
 		value, isNew, err := c.Get(e.k, nil)
 		assert.Equal(t, []byte(e.k), value)
 		assert.NoError(t, err)
 		if e.n {
-			assert.True(t, isNew)
+			assert.True(t, isNew, "[%d] %q %v", i, e.k, e.n)
 		} else {
-			assert.False(t, isNew)
+			assert.False(t, isNew, "[%d] %q %v", i, e.k, e.n)
 		}
 	}
 }
@@ -238,27 +239,26 @@ func TestEvictionLRU(t *testing.T) {
 		n bool
 	}
 
-	for _, e := range []tc{
-		{"a", true},
-		{"b", true},
-		{"c", true},
-		{"d", true},
-		{"e", true},
-		{"f", true},
-		{"a", true},
-		{"f", false},
-		{"b", true},
-		{"c", true},
-		{"d", true},
-		{"f", false},
+	for i, e := range []tc{
+		{"1", true},
+		{"2", true},
+		{"3", true},
+		{"4", true},
+		{"5", true},
+		{"6", true},
+		{"1", true},
+		{"6", false},
+		{"2", true},
+		{"3", true},
+		{"4", true},
 	} {
 		value, isNew, err := c.Get(e.k, nil)
 		assert.Equal(t, []byte(e.k), value)
 		assert.NoError(t, err)
 		if e.n {
-			assert.True(t, isNew)
+			assert.True(t, isNew, "[%d] %q %v", i, e.k, e.n)
 		} else {
-			assert.False(t, isNew)
+			assert.False(t, isNew, "[%d] %q %v", i, e.k, e.n)
 		}
 	}
 }
@@ -309,29 +309,65 @@ func makeKey(i int) string {
 	return fmt.Sprintf("%08d", i)
 }
 
-func BenchmarkGet(b *testing.B) {
+func BenchmarkGetSerial(b *testing.B) {
 	m := map[string]Strategy{
 		"FIFO": StrategyFIFO(),
 		"LRU":  StrategyLRU(),
 		"LFU":  StrategyLFU(),
 	}
 
+	rng := rand.NewSource(1)
+
 	for _, name := range []string{"FIFO", "LRU", "LFU"} {
-		for _, keyCount := range []int{10, 100, 1000, 10000, 100000, 1000000} {
+		for _, keyCount := range []int{10, 100, 1000, 10000} {
 			b.Run(fmt.Sprintf("strategy=%s;keys=%d", name, keyCount), func(b *testing.B) {
 				path := tempfile("test.db")
 				defer os.Remove(path)
 
-				c := New("test", SetPath(path), SetLowMark(keyCount/3*2), SetHighMark(keyCount/5*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+				c := New("test", SetPath(path), SetLowMark((keyCount/3)*2), SetHighMark((keyCount/5)*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+					time.Sleep(time.Millisecond)
 					return []byte(key), nil
 				}))
 				defer c.Close()
 
 				for i := 0; i < b.N; i++ {
-					if _, _, err := c.Get(makeKey(i%keyCount), nil); err != nil {
+					if _, _, err := c.Get(makeKey(int(rng.Int63())%keyCount), nil); err != nil {
 						b.FailNow()
 					}
 				}
+			})
+		}
+	}
+}
+
+func BenchmarkGetParallel(b *testing.B) {
+	m := map[string]Strategy{
+		"FIFO": StrategyFIFO(),
+		"LRU":  StrategyLRU(),
+		"LFU":  StrategyLFU(),
+	}
+
+	rng := rand.NewSource(1)
+
+	b.SetParallelism(100)
+
+	for _, name := range []string{"FIFO", "LRU", "LFU"} {
+		for _, keyCount := range []int{10, 100, 1000, 10000} {
+			b.Run(fmt.Sprintf("strategy=%s;keys=%d", name, keyCount), func(b *testing.B) {
+				path := tempfile("test.db")
+				defer os.Remove(path)
+
+				c := New("test", SetPath(path), SetLowMark((keyCount/3)*2), SetHighMark((keyCount/5)*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+					time.Sleep(time.Millisecond)
+					return []byte(key), nil
+				}))
+				defer c.Close()
+
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						c.Get(makeKey(int(rng.Int63())%keyCount), nil)
+					}
+				})
 			})
 		}
 	}

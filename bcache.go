@@ -30,10 +30,18 @@ type Cache struct {
 	dbError    error
 	dbReady    bool
 	dbCanClose bool
+
+	runningLock sync.RWMutex
+	running     map[string]*sync.RWMutex
+	runningRefs map[*sync.RWMutex]int
 }
 
 func New(name string, options ...Option) *Cache {
-	c := Cache{name: name}
+	c := Cache{
+		name:        name,
+		running:     make(map[string]*sync.RWMutex),
+		runningRefs: make(map[*sync.RWMutex]int),
+	}
 
 	for _, fn := range options {
 		fn(&c)
@@ -224,91 +232,206 @@ func (c *Cache) Get(key string, userdata interface{}) ([]byte, bool, error) {
 	return c.GetAt(key, time.Now(), userdata)
 }
 
+func (c *Cache) readJobState(tx *bolt.Tx, k []byte, t time.Time, m *meta, rres *[]byte, rerr *error, found *bool) error {
+	mb := tx.Bucket([]byte(c.name + "#meta"))
+	db := tx.Bucket([]byte(c.name + "#data"))
+	eb := tx.Bucket([]byte(c.name + "#errs"))
+
+	md := mb.Get(k)
+	if len(md) == 0 {
+		return nil
+	}
+
+	if err := m.decode(md); err != nil {
+		return err
+	}
+
+	// don't return items that have expired
+	if c.maxAge != 0 && time.Duration(t.UnixNano()-int64(m.createdAt)) > c.maxAge {
+		return nil
+	}
+
+	*found = true
+
+	if d := db.Get(k); len(d) > 0 {
+		*rres = d
+	}
+
+	if c.keepErrors {
+		if e := eb.Get(k); len(e) > 0 {
+			*rerr = errors.New(string(e))
+		}
+	}
+
+	return nil
+}
+
+func (c *Cache) getWorkerLock(key string) *sync.RWMutex {
+	c.runningLock.Lock()
+	defer c.runningLock.Unlock()
+
+	if l, ok := c.running[key]; ok {
+		c.runningRefs[l] = c.runningRefs[l] + 1
+		return l
+	}
+
+	l := &sync.RWMutex{}
+
+	c.running[key] = l
+	c.runningRefs[l] = 1
+
+	return l
+}
+
+func (c *Cache) clearWorkerLock(key string, l *sync.RWMutex) {
+	c.runningLock.Lock()
+	defer c.runningLock.Unlock()
+
+	if n, ok := c.runningRefs[l]; ok {
+		c.runningRefs[l] = n - 1
+	}
+
+	if c.runningRefs[l] == 0 {
+		delete(c.runningRefs, l)
+
+		if c.running[key] == l {
+			delete(c.running, key)
+		}
+	}
+}
+
+func (c *Cache) increment(k []byte, t time.Time) error {
+	return c.db.Update(func(tx *bolt.Tx) error {
+		var m meta
+
+		b := tx.Bucket([]byte(c.name + "#meta"))
+
+		d := b.Get(k)
+		if len(d) == 0 {
+			return nil
+		}
+
+		if err := m.decode(d); err != nil {
+			return err
+		}
+
+		m.accessCount++
+		if n := uint64(t.UnixNano()); n > m.accessedAt {
+			m.accessedAt = n
+		}
+
+		return b.Put(k, m.encode())
+	})
+}
+
+func withRLock(m *sync.RWMutex, fn func() error) error {
+	m.RLock()
+	defer m.RUnlock()
+	return fn()
+}
+
+func withLock(m *sync.RWMutex, fn func() error) error {
+	m.Lock()
+	defer m.Unlock()
+	return fn()
+}
+
 func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bool, error) {
 	if err := c.ensureOpen(); err != nil {
 		return nil, false, err
 	}
 
+	// sha1, more like shafun
+
 	h := sha1.New()
 	h.Write([]byte(key))
 	k := h.Sum(nil)
 
+	var m meta
 	var rres []byte
-	var isNew bool
 	var rerr error
+	var found bool
+
+	// first try to read the result - this should not block any other simple
+	// read, but will be blocked by updates. this is desired behaviour.
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		return c.readJobState(tx, k, t, &m, &rres, &rerr, &found)
+	}); err != nil {
+		return nil, false, err
+	}
+
+	if found {
+		if err := c.increment(k, t); err != nil {
+			return nil, false, err
+		}
+
+		return rres, false, rerr
+	}
+
+	// the result wasn't easily available - now we need to try to run the worker
+	// function. the `getWorkerLock` and `clearWorkerLock` form a reference-
+	// counting pair that will remove the lock entirely once no workers are
+	// using it.
+
+	l := c.getWorkerLock(key)
+	defer c.clearWorkerLock(key, l)
+
+	l.Lock()
+	defer l.Unlock()
+
+	// the value might have been fetched and saved while we were waiting for the
+	// lock.
+
+	if err := c.db.View(func(tx *bolt.Tx) error {
+		return c.readJobState(tx, k, t, &m, &rres, &rerr, &found)
+	}); err != nil {
+		return nil, false, err
+	}
+
+	if found {
+		if err := c.increment(k, t); err != nil {
+			return nil, false, err
+		}
+
+		return rres, false, rerr
+	}
+
+	// if we don't have the value by now, it means we'll be the only one working
+	// with this lock. other potential workers will be blocked above at
+	// `l.Lock`, and will see the value we put into the db when they get to
+	// `c.db.View`.
+
+	copy(m.hash[:], k[0:20])
+	m.createdAt = uint64(t.UnixNano())
+	m.accessedAt = uint64(t.UnixNano())
+	m.accessCount = 0
+
+	rres, rerr = c.worker(key, userdata)
+	if !c.keepErrors && rerr != nil {
+		return nil, false, rerr
+	}
 
 	if err := c.db.Update(func(tx *bolt.Tx) error {
 		mb := tx.Bucket([]byte(c.name + "#meta"))
 		db := tx.Bucket([]byte(c.name + "#data"))
 		eb := tx.Bucket([]byte(c.name + "#errs"))
 
-		m := &meta{}
-
-		copy(m.hash[:], k[0:20])
-
-		if d := mb.Get(k); len(d) != 0 {
-			if err := m.decode(d); err != nil {
-				return err
-			}
-
-			if c.maxAge != 0 && time.Duration(t.UnixNano()-int64(m.createdAt)) > c.maxAge {
-				if err := mb.Delete(k); err != nil {
-					return err
-				}
-				if err := db.Delete(k); err != nil {
-					return err
-				}
+		if err := mb.Put(k, m.encode()); err != nil {
+			return err
+		}
+		if err := db.Put(k, rres); err != nil {
+			return err
+		}
+		if c.keepErrors {
+			if rerr == nil {
 				if err := eb.Delete(k); err != nil {
 					return err
 				}
-
-				m.createdAt = uint64(t.UnixNano())
-				m.accessedAt = uint64(t.UnixNano())
-				m.accessCount = 0
-				isNew = true
-			}
-		} else {
-			m.createdAt = uint64(t.UnixNano())
-			m.accessedAt = uint64(t.UnixNano())
-			m.accessCount = 0
-			isNew = true
-		}
-
-		if isNew {
-			d, err := c.worker(key, userdata)
-			if err != nil {
-				if !c.keepErrors {
+			} else {
+				if err := eb.Put(k, []byte(rerr.Error())); err != nil {
 					return err
 				}
-
-				if err := eb.Put(k, []byte(err.Error())); err != nil {
-					return err
-				}
-
-				rerr = errors.New(err.Error())
 			}
-
-			if err := db.Put(k, d); err != nil {
-				return err
-			}
-
-			rres = d
-		} else {
-			if d := db.Get(k); len(d) > 0 {
-				rres = d
-			}
-
-			if c.keepErrors {
-				if e := eb.Get(k); len(e) > 0 {
-					rerr = errors.New(string(e))
-				}
-			}
-		}
-
-		m.accessedAt = uint64(t.UnixNano())
-		m.accessCount++
-		if err := mb.Put(k, m.encode()); err != nil {
-			return err
 		}
 
 		if c.highMark != 0 && mb.Stats().KeyN >= c.highMark {
@@ -322,7 +445,7 @@ func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bo
 		return nil, false, err
 	}
 
-	return rres, isNew, rerr
+	return rres, true, rerr
 }
 
 func (c *Cache) Purge(key string) error {
@@ -349,6 +472,10 @@ func (c *Cache) Purge(key string) error {
 	})
 }
 
+func (c *Cache) Cleanup() error {
+	return c.CleanupAt(time.Now())
+}
+
 func (c *Cache) CleanupAt(t time.Time) error {
 	if err := c.ensureOpen(); err != nil {
 		return err
@@ -357,10 +484,6 @@ func (c *Cache) CleanupAt(t time.Time) error {
 	return c.db.Update(func(tx *bolt.Tx) error {
 		return c.cleanup(tx, t)
 	})
-}
-
-func (c *Cache) Cleanup() error {
-	return c.CleanupAt(time.Now())
 }
 
 type metaContext struct {
