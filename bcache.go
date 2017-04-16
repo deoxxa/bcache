@@ -13,7 +13,8 @@ import (
 
 type Option func(c *Cache)
 type Worker func(key string, userdata interface{}) ([]byte, error)
-type Strategy func(t time.Time, a, b meta) bool
+type Strategy func(t time.Time, a, b Meta) bool
+type EvictionFunc func(m Meta, t time.Time, d []byte, err []byte)
 
 type Cache struct {
 	name       string
@@ -34,6 +35,8 @@ type Cache struct {
 	runningLock sync.RWMutex
 	running     map[string]*sync.RWMutex
 	runningRefs map[*sync.RWMutex]int
+
+	onEviction EvictionFunc
 }
 
 func New(name string, options ...Option) *Cache {
@@ -105,6 +108,13 @@ func SetLowMark(lowMark int) Option {
 	}
 }
 
+func SetLimit(maxEntries int, overCorrect float64) Option {
+	return func(c *Cache) {
+		c.highMark = maxEntries
+		c.lowMark = maxEntries - int(float64(maxEntries)*overCorrect)
+	}
+}
+
 func SetMaxAge(age time.Duration) Option {
 	return func(c *Cache) {
 		c.maxAge = age
@@ -114,6 +124,12 @@ func SetMaxAge(age time.Duration) Option {
 func SetStrategy(strategy Strategy) Option {
 	return func(c *Cache) {
 		c.strategy = strategy
+	}
+}
+
+func SetOnEviction(evictionFunc EvictionFunc) Option {
+	return func(c *Cache) {
+		c.onEviction = evictionFunc
 	}
 }
 
@@ -183,48 +199,48 @@ func (c *Cache) ensureOpen() error {
 	return nil
 }
 
-type meta struct {
-	hash        [20]byte
-	createdAt   uint64
-	accessedAt  uint64
-	accessCount uint64
+type Meta struct {
+	Hash        [20]byte
+	CreatedAt   uint64
+	AccessedAt  uint64
+	AccessCount uint64
 }
 
-func (m *meta) decode(b []byte) error {
+func (m *Meta) decode(b []byte) error {
 	if len(b) != 24 {
 		return errors.New("invalid data length")
 	}
 
-	m.createdAt = binary.BigEndian.Uint64(b[0:8])
-	m.accessedAt = binary.BigEndian.Uint64(b[8:16])
-	m.accessCount = binary.BigEndian.Uint64(b[16:24])
+	m.CreatedAt = binary.BigEndian.Uint64(b[0:8])
+	m.AccessedAt = binary.BigEndian.Uint64(b[8:16])
+	m.AccessCount = binary.BigEndian.Uint64(b[16:24])
 
 	return nil
 }
 
-func (m *meta) encode() []byte {
+func (m *Meta) encode() []byte {
 	var b [24]byte
-	binary.BigEndian.PutUint64(b[0:8], m.createdAt)
-	binary.BigEndian.PutUint64(b[8:16], m.accessedAt)
-	binary.BigEndian.PutUint64(b[16:24], m.accessCount)
+	binary.BigEndian.PutUint64(b[0:8], m.CreatedAt)
+	binary.BigEndian.PutUint64(b[8:16], m.AccessedAt)
+	binary.BigEndian.PutUint64(b[16:24], m.AccessCount)
 	return b[:]
 }
 
 func StrategyFIFO() Strategy {
-	return func(_ time.Time, a, b meta) bool {
-		return a.createdAt < b.createdAt
+	return func(_ time.Time, a, b Meta) bool {
+		return a.CreatedAt < b.CreatedAt
 	}
 }
 
 func StrategyLRU() Strategy {
-	return func(_ time.Time, a, b meta) bool {
-		return a.accessedAt < b.accessedAt
+	return func(_ time.Time, a, b Meta) bool {
+		return a.AccessedAt < b.AccessedAt
 	}
 }
 
 func StrategyLFU() Strategy {
-	return func(_ time.Time, a, b meta) bool {
-		return a.accessCount < b.accessCount
+	return func(_ time.Time, a, b Meta) bool {
+		return a.AccessCount < b.AccessCount
 	}
 }
 
@@ -232,7 +248,7 @@ func (c *Cache) Get(key string, userdata interface{}) ([]byte, bool, error) {
 	return c.GetAt(key, time.Now(), userdata)
 }
 
-func (c *Cache) readJobState(tx *bolt.Tx, k []byte, t time.Time, m *meta, rres *[]byte, rerr *error, found *bool) error {
+func (c *Cache) readJobState(tx *bolt.Tx, k []byte, t time.Time, m *Meta, rres *[]byte, rerr *error, found *bool) error {
 	mb := tx.Bucket([]byte(c.name + "#meta"))
 	db := tx.Bucket([]byte(c.name + "#data"))
 	eb := tx.Bucket([]byte(c.name + "#errs"))
@@ -247,7 +263,7 @@ func (c *Cache) readJobState(tx *bolt.Tx, k []byte, t time.Time, m *meta, rres *
 	}
 
 	// don't return items that have expired
-	if c.maxAge != 0 && time.Duration(t.UnixNano()-int64(m.createdAt)) > c.maxAge {
+	if c.maxAge != 0 && time.Duration(t.UnixNano()-int64(m.CreatedAt)) > c.maxAge {
 		return nil
 	}
 
@@ -302,7 +318,7 @@ func (c *Cache) clearWorkerLock(key string, l *sync.RWMutex) {
 
 func (c *Cache) increment(k []byte, t time.Time) error {
 	return c.db.Update(func(tx *bolt.Tx) error {
-		var m meta
+		var m Meta
 
 		b := tx.Bucket([]byte(c.name + "#meta"))
 
@@ -315,9 +331,9 @@ func (c *Cache) increment(k []byte, t time.Time) error {
 			return err
 		}
 
-		m.accessCount++
-		if n := uint64(t.UnixNano()); n > m.accessedAt {
-			m.accessedAt = n
+		m.AccessCount++
+		if n := uint64(t.UnixNano()); n > m.AccessedAt {
+			m.AccessedAt = n
 		}
 
 		return b.Put(k, m.encode())
@@ -347,7 +363,7 @@ func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bo
 	h.Write([]byte(key))
 	k := h.Sum(nil)
 
-	var m meta
+	var m Meta
 	var rres []byte
 	var rerr error
 	var found bool
@@ -401,10 +417,10 @@ func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bo
 	// `l.Lock`, and will see the value we put into the db when they get to
 	// `c.db.View`.
 
-	copy(m.hash[:], k[0:20])
-	m.createdAt = uint64(t.UnixNano())
-	m.accessedAt = uint64(t.UnixNano())
-	m.accessCount = 0
+	copy(m.Hash[:], k[0:20])
+	m.CreatedAt = uint64(t.UnixNano())
+	m.AccessedAt = uint64(t.UnixNano())
+	m.AccessCount = 0
 
 	rres, rerr = c.worker(key, userdata)
 	if !c.keepErrors && rerr != nil {
@@ -488,11 +504,11 @@ func (c *Cache) CleanupAt(t time.Time) error {
 
 type metaContext struct {
 	t time.Time
-	a []meta
+	a []Meta
 	f Strategy
 }
 
-func (m *metaContext) add(e meta) { m.a = append(m.a, e) }
+func (m *metaContext) add(e Meta) { m.a = append(m.a, e) }
 
 func (m *metaContext) Len() int      { return len(m.a) }
 func (m *metaContext) Swap(a, b int) { m.a[a], m.a[b] = m.a[b], m.a[a] }
@@ -518,8 +534,8 @@ func (c *Cache) cleanup(tx *bolt.Tx, t time.Time) error {
 			return errors.New("invalid key length during iteration")
 		}
 
-		var m meta
-		copy(m.hash[:], k[0:20])
+		var m Meta
+		copy(m.Hash[:], k[0:20])
 		if err := m.decode(v); err != nil {
 			return err
 		}
@@ -532,14 +548,18 @@ func (c *Cache) cleanup(tx *bolt.Tx, t time.Time) error {
 	// first evict things that have expired
 	if c.maxAge != 0 {
 		for i := 0; i < len(a.a); i++ {
-			if time.Duration(t.UnixNano()-int64(a.a[i].createdAt)) > c.maxAge {
-				if err := mb.Delete(a.a[i].hash[:]); err != nil {
+			if time.Duration(t.UnixNano()-int64(a.a[i].CreatedAt)) > c.maxAge {
+				if c.onEviction != nil {
+					c.onEviction(a.a[i], t, db.Get(a.a[i].Hash[i:]), eb.Get(a.a[i].Hash[i:]))
+				}
+
+				if err := mb.Delete(a.a[i].Hash[:]); err != nil {
 					return err
 				}
-				if err := db.Delete(a.a[i].hash[:]); err != nil {
+				if err := db.Delete(a.a[i].Hash[:]); err != nil {
 					return err
 				}
-				if err := eb.Delete(a.a[i].hash[:]); err != nil {
+				if err := eb.Delete(a.a[i].Hash[:]); err != nil {
 					return err
 				}
 
@@ -553,13 +573,17 @@ func (c *Cache) cleanup(tx *bolt.Tx, t time.Time) error {
 
 	toRemove := len(a.a) - c.lowMark
 	for i := 0; i < toRemove; i++ {
-		if err := mb.Delete(a.a[i].hash[:]); err != nil {
+		if c.onEviction != nil {
+			c.onEviction(a.a[i], t, db.Get(a.a[i].Hash[i:]), eb.Get(a.a[i].Hash[i:]))
+		}
+
+		if err := mb.Delete(a.a[i].Hash[:]); err != nil {
 			return err
 		}
-		if err := db.Delete(a.a[i].hash[:]); err != nil {
+		if err := db.Delete(a.a[i].Hash[:]); err != nil {
 			return err
 		}
-		if err := eb.Delete(a.a[i].hash[:]); err != nil {
+		if err := eb.Delete(a.a[i].Hash[:]); err != nil {
 			return err
 		}
 	}

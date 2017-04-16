@@ -179,6 +179,64 @@ func TestMaxAge(t *testing.T) {
 	assert.Equal(t, 2, count)
 }
 
+func TestOnEvictOne(t *testing.T) {
+	path := tempfile("test.db")
+	defer os.Remove(path)
+
+	var evicted []*Meta
+
+	c := New("test", SetPath(path), SetLowMark(2), SetHighMark(2), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+		return []byte(key), nil
+	}), SetOnEviction(func(m Meta, t time.Time, d []byte, err []byte) {
+		evicted = append(evicted, &m)
+	}))
+	assert.NotNil(t, c)
+	defer c.Close()
+
+	t1 := time.Now()
+	t2 := time.Now().Add(time.Second * 30)
+	t3 := time.Now().Add(time.Minute * 5)
+
+	c.GetAt("1", t1, nil)
+	assert.Len(t, evicted, 0)
+	c.GetAt("2", t2, nil)
+	assert.Len(t, evicted, 0)
+	c.GetAt("3", t3, nil)
+	assert.Len(t, evicted, 1)
+	assert.Equal(t, uint64(t1.UnixNano()), evicted[0].CreatedAt)
+}
+
+func TestOnEvictMultiple(t *testing.T) {
+	path := tempfile("test.db")
+	defer os.Remove(path)
+
+	var evicted []*Meta
+
+	c := New("test", SetPath(path), SetLowMark(2), SetHighMark(3), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+		return []byte(key), nil
+	}), SetOnEviction(func(m Meta, t time.Time, d []byte, err []byte) {
+		evicted = append(evicted, &m)
+	}))
+	assert.NotNil(t, c)
+	defer c.Close()
+
+	t1 := time.Now()
+	t2 := time.Now().Add(time.Second * 30)
+	t3 := time.Now().Add(time.Minute * 5)
+	t4 := time.Now().Add(time.Minute * 10)
+
+	c.GetAt("1", t1, nil)
+	assert.Len(t, evicted, 0)
+	c.GetAt("2", t2, nil)
+	assert.Len(t, evicted, 0)
+	c.GetAt("3", t3, nil)
+	assert.Len(t, evicted, 0)
+	c.GetAt("4", t4, nil)
+	assert.Len(t, evicted, 2)
+	assert.Equal(t, uint64(t1.UnixNano()), evicted[0].CreatedAt)
+	assert.Equal(t, uint64(t2.UnixNano()), evicted[1].CreatedAt)
+}
+
 func TestEvictionFIFO(t *testing.T) {
 	path := tempfile("test.db")
 	defer os.Remove(path)
@@ -325,7 +383,7 @@ func BenchmarkGetSerial(b *testing.B) {
 				defer os.Remove(path)
 
 				c := New("test", SetPath(path), SetLowMark((keyCount/3)*2), SetHighMark((keyCount/5)*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
-					time.Sleep(time.Millisecond)
+					time.Sleep(time.Millisecond * 10)
 					return []byte(key), nil
 				}))
 				defer c.Close()
@@ -358,7 +416,7 @@ func BenchmarkGetParallel(b *testing.B) {
 				defer os.Remove(path)
 
 				c := New("test", SetPath(path), SetLowMark((keyCount/3)*2), SetHighMark((keyCount/5)*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
-					time.Sleep(time.Millisecond)
+					time.Sleep(time.Millisecond * 10)
 					return []byte(key), nil
 				}))
 				defer c.Close()
