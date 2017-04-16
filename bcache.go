@@ -16,6 +16,7 @@ type Worker func(key string, userdata interface{}) ([]byte, error)
 type Strategy func(t time.Time, a, b meta) bool
 
 type Cache struct {
+	name       string
 	worker     Worker
 	path       string
 	keepErrors bool
@@ -24,13 +25,15 @@ type Cache struct {
 	maxAge     time.Duration
 	strategy   Strategy
 
-	dbLock  sync.RWMutex
-	db      *bolt.DB
-	dbError error
+	dbLock     sync.RWMutex
+	db         *bolt.DB
+	dbError    error
+	dbReady    bool
+	dbCanClose bool
 }
 
-func New(options ...Option) *Cache {
-	var c Cache
+func New(name string, options ...Option) *Cache {
+	c := Cache{name: name}
 
 	for _, fn := range options {
 		fn(&c)
@@ -44,11 +47,17 @@ func (c *Cache) ForceInit() error {
 }
 
 func (c *Cache) Close() error {
-	if c.db == nil {
+	if c.db == nil || !c.dbCanClose {
 		return nil
 	}
 
 	return c.db.Close()
+}
+
+func SetName(name string) Option {
+	return func(c *Cache) {
+		c.name = name
+	}
 }
 
 func SetWorker(worker Worker) Option {
@@ -60,6 +69,13 @@ func SetWorker(worker Worker) Option {
 func SetPath(path string) Option {
 	return func(c *Cache) {
 		c.path = path
+	}
+}
+
+func SetDB(db *bolt.DB) Option {
+	return func(c *Cache) {
+		c.db = db
+		c.dbCanClose = false
 	}
 }
 
@@ -95,7 +111,7 @@ func SetStrategy(strategy Strategy) Option {
 
 func (c *Cache) ensureOpen() error {
 	c.dbLock.RLock()
-	if c.db != nil || c.dbError != nil {
+	if c.dbReady || c.dbError != nil {
 		c.dbLock.RUnlock()
 		return c.dbError
 	}
@@ -104,35 +120,59 @@ func (c *Cache) ensureOpen() error {
 	c.dbLock.Lock()
 	defer c.dbLock.Unlock()
 
-	if c.db != nil || c.dbError != nil {
+	if c.dbReady || c.dbError != nil {
 		return c.dbError
 	}
 
-	if db, err := bolt.Open(c.path, 0644, nil); err != nil {
-		c.dbError = err
-	} else {
-		if err := db.Update(func(tx *bolt.Tx) error {
-			if _, err := tx.CreateBucketIfNotExists([]byte("meta")); err != nil {
-				return err
-			}
+	db := c.db
+	dbCanClose := c.dbCanClose
 
-			if _, err := tx.CreateBucketIfNotExists([]byte("data")); err != nil {
-				return err
-			}
-
-			if _, err := tx.CreateBucketIfNotExists([]byte("errs")); err != nil {
-				return err
-			}
-
-			return nil
-		}); err != nil {
-			c.dbError = err
-		} else {
-			c.db = db
+	if db == nil {
+		if c.path == "" {
+			c.dbError = errors.New("Cache.ensureOpen: no db or path provided; can't continue")
+			return c.dbError
 		}
+
+		newDB, err := bolt.Open(c.path, 0644, nil)
+		if err != nil {
+			c.dbError = err
+			return err
+		}
+
+		db = newDB
+		dbCanClose = true
 	}
 
-	return c.dbError
+	if err := db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte(c.name + "#meta")); err != nil {
+			return err
+		}
+
+		if _, err := tx.CreateBucketIfNotExists([]byte(c.name + "#data")); err != nil {
+			return err
+		}
+
+		if _, err := tx.CreateBucketIfNotExists([]byte(c.name + "#errs")); err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		if c.db == nil {
+			// there was already an error we can't recover from, so this is just
+			// housekeeping. this is why there's no error check on db.Close().
+			_ = db.Close()
+		}
+
+		c.dbError = err
+		return c.dbError
+	}
+
+	c.db = db
+	c.dbReady = true
+	c.dbCanClose = dbCanClose
+
+	return nil
 }
 
 type meta struct {
@@ -198,9 +238,9 @@ func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bo
 	var rerr error
 
 	if err := c.db.Update(func(tx *bolt.Tx) error {
-		mb := tx.Bucket([]byte("meta"))
-		db := tx.Bucket([]byte("data"))
-		eb := tx.Bucket([]byte("errs"))
+		mb := tx.Bucket([]byte(c.name + "#meta"))
+		db := tx.Bucket([]byte(c.name + "#data"))
+		eb := tx.Bucket([]byte(c.name + "#errs"))
 
 		m := &meta{}
 
@@ -285,6 +325,44 @@ func (c *Cache) GetAt(key string, t time.Time, userdata interface{}) ([]byte, bo
 	return rres, isNew, rerr
 }
 
+func (c *Cache) Purge(key string) error {
+	if err := c.ensureOpen(); err != nil {
+		return err
+	}
+
+	h := sha1.New()
+	h.Write([]byte(key))
+	k := h.Sum(nil)
+
+	return c.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket([]byte(c.name + "#meta")).Delete(k); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte(c.name + "#data")).Delete(k); err != nil {
+			return err
+		}
+		if err := tx.Bucket([]byte(c.name + "#errs")).Delete(k); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func (c *Cache) CleanupAt(t time.Time) error {
+	if err := c.ensureOpen(); err != nil {
+		return err
+	}
+
+	return c.db.Update(func(tx *bolt.Tx) error {
+		return c.cleanup(tx, t)
+	})
+}
+
+func (c *Cache) Cleanup() error {
+	return c.CleanupAt(time.Now())
+}
+
 type metaContext struct {
 	t time.Time
 	a []meta
@@ -306,9 +384,9 @@ func (m *metaContext) Less(a, b int) bool {
 }
 
 func (c *Cache) cleanup(tx *bolt.Tx, t time.Time) error {
-	mb := tx.Bucket([]byte("meta"))
-	db := tx.Bucket([]byte("data"))
-	eb := tx.Bucket([]byte("errs"))
+	mb := tx.Bucket([]byte(c.name + "#meta"))
+	db := tx.Bucket([]byte(c.name + "#data"))
+	eb := tx.Bucket([]byte(c.name + "#errs"))
 
 	a := metaContext{t: t, f: c.strategy}
 

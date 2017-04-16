@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boltdb/bolt"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -18,8 +19,30 @@ func tempfile(prefix string) string {
 }
 
 func TestNew(t *testing.T) {
-	c := New()
+	path := tempfile("test.db")
+	defer os.Remove(path)
+
+	c := New("test", SetPath(path))
 	assert.NotNil(t, c)
+	defer c.Close()
+
+	assert.NoError(t, c.ForceInit())
+}
+
+func TestSetDB(t *testing.T) {
+	path := tempfile("test.db")
+	defer os.Remove(path)
+
+	db, err := bolt.Open(path, 0644, nil)
+	assert.NoError(t, err)
+	defer db.Close()
+
+	c := New("test", SetDB(db))
+	assert.NotNil(t, c)
+	assert.NoError(t, c.ForceInit())
+	assert.NoError(t, c.Close())
+
+	assert.NoError(t, db.Sync())
 }
 
 func TestGet(t *testing.T) {
@@ -28,7 +51,7 @@ func TestGet(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		return []byte("hello, " + key), nil
 	}))
@@ -72,7 +95,7 @@ func TestKeepErrors(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetKeepErrors(true), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetKeepErrors(true), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		if key == "a" {
 			return nil, fmt.Errorf("err")
@@ -120,7 +143,7 @@ func TestMaxAge(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetMaxAge(time.Minute), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetMaxAge(time.Minute), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		return []byte(key), nil
 	}))
@@ -161,7 +184,7 @@ func TestEvictionFIFO(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyFIFO()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyFIFO()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		return []byte(key), nil
 	}))
@@ -203,7 +226,7 @@ func TestEvictionLRU(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyLRU()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyLRU()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		return []byte(key), nil
 	}))
@@ -246,7 +269,7 @@ func TestEvictionLFU(t *testing.T) {
 
 	count := 0
 
-	c := New(SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyLFU()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+	c := New("test", SetPath(path), SetLowMark(3), SetHighMark(5), SetStrategy(StrategyLFU()), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 		count++
 		return []byte(key), nil
 	}))
@@ -299,7 +322,7 @@ func BenchmarkGet(b *testing.B) {
 				path := tempfile("test.db")
 				defer os.Remove(path)
 
-				c := New(SetPath(path), SetLowMark(keyCount/3*2), SetHighMark(keyCount/5*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
+				c := New("test", SetPath(path), SetLowMark(keyCount/3*2), SetHighMark(keyCount/5*4), SetStrategy(m[name]), SetWorker(func(key string, userdata interface{}) ([]byte, error) {
 					return []byte(key), nil
 				}))
 				defer c.Close()
